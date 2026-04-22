@@ -4,7 +4,6 @@ import os
 import json
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import folium
 import plotly.graph_objects as go
 import streamlit as st
@@ -18,7 +17,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "nta_risk.geojson")
+DATA_PATH  = os.path.join(os.path.dirname(__file__), "data", "nta_risk.geojson")
+INFRA_PATH = os.path.join(os.path.dirname(__file__), "data", "infrastructure.csv")
+
+INFRA_STYLE = {
+    "Fire Services":           {"color": "#e74c3c", "icon": "fire"},
+    "Hospitals & Clinics":     {"color": "#f39c12", "icon": "plus-sign"},
+    "Other Emergency Services":{"color": "#9b59b6", "icon": "star"},
+    "Bus Depots & Terminals":  {"color": "#2ecc71", "icon": "transfer"},
+}
 
 LAYERS = {
     "Composite Risk (Hazard + Vulnerability)": {
@@ -45,21 +52,62 @@ RISK_COLORS = {
 }
 
 
+def _geom_bounds(geom):
+    """Return [minx, miny, maxx, maxy] from a GeoJSON geometry dict."""
+    if geom is None:
+        return None
+    gtype = geom.get("type", "")
+    if gtype == "Polygon":
+        coords = [c for ring in geom["coordinates"] for c in ring]
+    elif gtype == "MultiPolygon":
+        coords = [c for poly in geom["coordinates"] for ring in poly for c in ring]
+    else:
+        return None
+    if not coords:
+        return None
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _safe_val(v):
+    """Convert numpy/NaN values to JSON-safe Python types."""
+    if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+        return None
+    if hasattr(v, "item"):
+        return v.item()
+    return v
+
+
 @st.cache_data
 def load_data():
-    gdf = gpd.read_file(DATA_PATH)
-    if gdf.crs and gdf.crs.to_epsg() != 4326:
-        gdf = gdf.to_crs(4326)
-    gdf["display_name"] = gdf["ntaname"].fillna(gdf.get("NTA Name", gdf["ntacode"]))
+    with open(DATA_PATH, encoding="utf-8") as f:
+        raw = json.load(f)
+    rows = []
+    for feat in raw["features"]:
+        row = {k: v for k, v in feat["properties"].items()}
+        row["_geometry"] = feat["geometry"]
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df["display_name"] = df["ntaname"].fillna(df.get("NTA Name", df.get("ntacode", "")))
     for col in ("hazard_score", "composite_score"):
-        gdf[col] = pd.to_numeric(gdf[col], errors="coerce").clip(0, 1)
-    gdf["Population"] = pd.to_numeric(gdf["Population"], errors="coerce")
-    gdf["total_ntas"] = int(gdf["total_ntas"].iloc[0]) if "total_ntas" in gdf.columns else 195
-    return gdf
+        df[col] = pd.to_numeric(df[col], errors="coerce").clip(0, 1)
+    df["Population"] = pd.to_numeric(df["Population"], errors="coerce")
+    df["total_ntas"] = int(df["total_ntas"].iloc[0]) if "total_ntas" in df.columns else 195
+    return df
+
+
+@st.cache_data
+def load_infrastructure():
+    if not os.path.exists(INFRA_PATH):
+        return pd.DataFrame()
+    df = pd.read_csv(INFRA_PATH)
+    df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    return df.dropna(subset=["latitude", "longitude"])
 
 
 def score_to_color(score):
-    """Linear interpolation: green (0) → amber (0.5) → red (1)."""
     if pd.isna(score):
         return "#444444"
     s = float(np.clip(score, 0, 1))
@@ -69,24 +117,23 @@ def score_to_color(score):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def build_map(gdf, score_col, category_col, selected_ntacode):
+def build_map(df, score_col, category_col, selected_ntacode, infra_df=None, infra_cats=None):
     m = folium.Map(location=[40.7128, -74.0060], zoom_start=11, tiles="CartoDB dark_matter")
 
-    # Pre-compute style into GeoJSON properties so no Python closures needed
-    gdf_map = gdf.copy()
-    gdf_map["_fill"]   = gdf_map[score_col].apply(score_to_color)
-    gdf_map["_stroke"] = "#1a1a1a"
-    gdf_map["_weight"] = 1.0
-    gdf_map["_fop"]    = 0.80
+    prop_cols = [c for c in df.columns if c != "_geometry"]
 
-    # Selected NTA overrides
-    mask = gdf_map["ntacode"] == selected_ntacode
-    gdf_map.loc[mask, "_fill"]   = "#3498db"
-    gdf_map.loc[mask, "_stroke"] = "#ffffff"
-    gdf_map.loc[mask, "_weight"] = 3.0
-    gdf_map.loc[mask, "_fop"]    = 0.92
+    features = []
+    for _, row in df.iterrows():
+        is_selected = row["ntacode"] == selected_ntacode
+        score = row[score_col]
+        props = {col: _safe_val(row[col]) for col in prop_cols}
+        props["_fill"]   = "#3498db" if is_selected else score_to_color(score)
+        props["_stroke"] = "#ffffff" if is_selected else "#1a1a1a"
+        props["_weight"] = 3.0 if is_selected else 1.0
+        props["_fop"]    = 0.92 if is_selected else 0.80
+        features.append({"type": "Feature", "geometry": row["_geometry"], "properties": props})
 
-    geojson_data = json.loads(gdf_map.to_json())
+    geojson_data = {"type": "FeatureCollection", "features": features}
 
     folium.GeoJson(
         geojson_data,
@@ -113,11 +160,36 @@ def build_map(gdf, score_col, category_col, selected_ntacode):
         ),
     ).add_to(m)
 
+    # ── Infrastructure overlay ─────────────────────────────────────────────────
+    if infra_df is not None and infra_cats:
+        for cat in infra_cats:
+            style = INFRA_STYLE.get(cat, {"color": "#aaaaaa", "icon": "info-sign"})
+            subset = infra_df[infra_df["category"] == cat]
+            grp = folium.FeatureGroup(name=cat, show=True)
+            for _, pt in subset.iterrows():
+                folium.CircleMarker(
+                    location=[pt["latitude"], pt["longitude"]],
+                    radius=5,
+                    color=style["color"],
+                    fill=True,
+                    fill_color=style["color"],
+                    fill_opacity=0.85,
+                    weight=1,
+                    tooltip=folium.Tooltip(
+                        f"<b>{pt.get('name','—')}</b><br>"
+                        f"<span style='color:{style['color']}'>{cat}</span>",
+                        sticky=False,
+                    ),
+                ).add_to(grp)
+            grp.add_to(m)
+        folium.LayerControl(collapsed=False).add_to(m)
+
     # Zoom to selected NTA
-    row = gdf[gdf["ntacode"] == selected_ntacode]
-    if not row.empty:
-        b = row.total_bounds
-        m.fit_bounds([[b[1], b[0]], [b[3], b[2]]])
+    sel = df[df["ntacode"] == selected_ntacode]
+    if not sel.empty:
+        b = _geom_bounds(sel.iloc[0]["_geometry"])
+        if b:
+            m.fit_bounds([[b[1], b[0]], [b[3], b[2]]])
 
     return m
 
@@ -171,7 +243,7 @@ def detail_card(row, layer_cfg, alt_layer_cfg, total_ntas):
     st.markdown(f"**Borough:** {borough}")
     st.divider()
 
-    score_missing = pd.isna(score) or score is None
+    score_missing = score is None or (isinstance(score, float) and np.isnan(score))
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -179,49 +251,46 @@ def detail_card(row, layer_cfg, alt_layer_cfg, total_ntas):
         st.metric(layer_cfg["label"], score_str)
         if score_missing:
             st.markdown(
-                '<span style="display:inline-block;padding:3px 12px;border-radius:10px;'
+                '<span style="display:inline-block;padding:3px 12px;border-radius:10px;' +
                 'background:#444;color:#aaa;font-size:13px;">No flood zone coverage</span>',
                 unsafe_allow_html=True,
             )
         else:
-            badge = (
-                f'<span style="display:inline-block;padding:3px 12px;border-radius:10px;'
-                f'background:{color};color:#fff;font-weight:bold;font-size:14px;">'
-                f'{category}</span>'
+            st.markdown(
+                f'<span style="display:inline-block;padding:3px 12px;border-radius:10px;' +
+                f'background:{color};color:#fff;font-weight:bold;font-size:14px;">{category}</span>',
+                unsafe_allow_html=True,
             )
-            st.markdown(badge, unsafe_allow_html=True)
     with col_b:
-        alt_missing = pd.isna(alt_score) or alt_score is None
+        alt_missing = alt_score is None or (isinstance(alt_score, float) and np.isnan(alt_score))
         alt_score_str = f"{float(alt_score):.3f}" if not alt_missing else "—"
         st.metric(alt_layer_cfg["label"], alt_score_str)
         alt_color = RISK_COLORS.get(alt_category, "#666")
         if alt_missing:
             st.markdown(
-                '<span style="display:inline-block;padding:3px 12px;border-radius:10px;'
+                '<span style="display:inline-block;padding:3px 12px;border-radius:10px;' +
                 'background:#444;color:#aaa;font-size:13px;">No flood zone coverage</span>',
                 unsafe_allow_html=True,
             )
         else:
-            alt_badge = (
-                f'<span style="display:inline-block;padding:3px 12px;border-radius:10px;'
-                f'background:{alt_color};color:#fff;font-weight:bold;font-size:14px;">'
-                f'{alt_category}</span>'
+            st.markdown(
+                f'<span style="display:inline-block;padding:3px 12px;border-radius:10px;' +
+                f'background:{alt_color};color:#fff;font-weight:bold;font-size:14px;">{alt_category}</span>',
+                unsafe_allow_html=True,
             )
-            st.markdown(alt_badge, unsafe_allow_html=True)
 
     st.markdown("")
-    pop_str = f"{int(pop):,}" if not pd.isna(pop) else "N/A"
+    pop_str = f"{int(pop):,}" if pop is not None and not (isinstance(pop, float) and np.isnan(pop)) else "N/A"
     st.markdown(f"**Population:** {pop_str}")
 
-    # Gauge: show active layer score; if missing, fall back to the other layer
     gauge_score = score if not score_missing else alt_score
     gauge_label = layer_cfg["label"] if not score_missing else f"{alt_layer_cfg['label']} (fallback)"
-    if gauge_score is not None and not pd.isna(gauge_score):
+    if gauge_score is not None and not (isinstance(gauge_score, float) and np.isnan(gauge_score)):
         st.plotly_chart(gauge_chart(gauge_score, gauge_label), use_container_width=True)
     else:
         st.markdown("*No raster data available for this area.*")
 
-    if not pd.isna(rank):
+    if rank is not None and not (isinstance(rank, float) and np.isnan(rank)):
         st.markdown(f"**Rank:** #{int(rank)} out of {total_ntas} neighborhoods")
 
     st.divider()
@@ -232,7 +301,7 @@ def detail_card(row, layer_cfg, alt_layer_cfg, total_ntas):
         )
     else:
         level = category if category not in ("Unknown", None) else "UNKNOWN"
-        rank_str = f"#{int(rank)}" if not pd.isna(rank) else "unranked"
+        rank_str = f"#{int(rank)}" if rank is not None and not (isinstance(rank, float) and np.isnan(rank)) else "unranked"
         st.info(
             f"This neighborhood has **{level}** flood risk. "
             f"It ranks **{rank_str}** in NYC for flood vulnerability "
@@ -240,13 +309,19 @@ def detail_card(row, layer_cfg, alt_layer_cfg, total_ntas):
         )
 
 
+# ── Load data ──────────────────────────────────────────────────────────────────
+gdf       = load_data()
+infra_df  = load_infrastructure()
+all_names = sorted(gdf["display_name"].dropna().unique().tolist())
+
+if "selected_name" not in st.session_state:
+    st.session_state["selected_name"] = all_names[0]
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🌊 NYC Flood Risk")
     st.caption("Explore flood vulnerability across NYC neighborhoods")
     st.divider()
-
-    gdf = load_data()
 
     active_layer_name = st.radio(
         "**Active Map Layer**",
@@ -260,18 +335,33 @@ with st.sidebar:
     st.caption(layer_cfg["description"])
     st.divider()
 
-    all_names = sorted(gdf["display_name"].dropna().unique().tolist())
-    selected_name = st.selectbox(
+    current_idx = all_names.index(st.session_state["selected_name"]) \
+        if st.session_state["selected_name"] in all_names else 0
+
+    sidebar_pick = st.selectbox(
         "Search neighborhood",
         options=all_names,
-        index=0,
+        index=current_idx,
     )
+    if sidebar_pick != st.session_state["selected_name"]:
+        st.session_state["selected_name"] = sidebar_pick
 
     risk_filter = st.multiselect(
         "Filter by risk level",
         options=["Low", "Medium", "High", "Unknown"],
         default=["Low", "Medium", "High", "Unknown"],
     )
+
+    st.divider()
+    st.markdown("**Key Infrastructure Overlay**")
+    infra_cats = []
+    for cat, style in INFRA_STYLE.items():
+        label = f"🔴 {cat}" if style["color"] == "#e74c3c" else \
+                f"🟠 {cat}" if style["color"] == "#f39c12" else \
+                f"🟣 {cat}" if style["color"] == "#9b59b6" else \
+                f"🟢 {cat}"
+        if st.checkbox(label, value=False, key=f"infra_{cat}"):
+            infra_cats.append(cat)
 
     st.divider()
     with st.expander("About"):
@@ -285,6 +375,7 @@ with st.sidebar:
         )
 
 # ── Apply filter ───────────────────────────────────────────────────────────────
+selected_name = st.session_state["selected_name"]
 cat_col = layer_cfg["category_col"]
 gdf_filtered = gdf[gdf[cat_col].isin(risk_filter)] if risk_filter else gdf.copy()
 
@@ -294,7 +385,7 @@ total_ntas    = int(gdf["total_ntas"].iloc[0])
 
 # ── Main panel ─────────────────────────────────────────────────────────────────
 st.title("NYC Flood Risk Explorer")
-st.caption(f"Viewing: **{active_layer_name}**  ·  {len(gdf_filtered)} neighborhoods shown")
+st.caption(f"Viewing: **{active_layer_name}**  ·  {len(gdf_filtered)} neighborhoods shown  ·  click a neighborhood on the map to select it")
 
 map_col, detail_col = st.columns([6, 4])
 
@@ -304,8 +395,23 @@ with map_col:
         score_col=layer_cfg["score_col"],
         category_col=layer_cfg["category_col"],
         selected_ntacode=selected_code,
+        infra_df=infra_df if infra_cats else None,
+        infra_cats=infra_cats,
     )
-    st_folium(fmap, use_container_width=True, height=560, returned_objects=[])
+    map_data = st_folium(
+        fmap,
+        use_container_width=True,
+        height=560,
+        returned_objects=["last_object_clicked"],
+    )
+
+    if map_data and map_data.get("last_object_clicked"):
+        props = map_data["last_object_clicked"].get("properties", {})
+        clicked_name = props.get("display_name") or props.get("ntaname")
+        if clicked_name and clicked_name in all_names \
+                and clicked_name != st.session_state["selected_name"]:
+            st.session_state["selected_name"] = clicked_name
+            st.rerun()
 
 with detail_col:
     detail_card(selected_row.to_dict(), layer_cfg, alt_layer_cfg, total_ntas)
