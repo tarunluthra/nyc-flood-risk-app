@@ -217,7 +217,7 @@ def detail_card(row, layer_cfg, alt_layer_cfg, total_ntas):
     gauge_score = score if not score_missing else alt_score
     gauge_label = layer_cfg["label"] if not score_missing else f"{alt_layer_cfg['label']} (fallback)"
     if gauge_score is not None and not pd.isna(gauge_score):
-        st.plotly_chart(gauge_chart(gauge_score, gauge_label), width="stretch")
+        st.plotly_chart(gauge_chart(gauge_score, gauge_label), use_container_width=True)
     else:
         st.markdown("*No raster data available for this area.*")
 
@@ -333,7 +333,7 @@ table_df = table_df.sort_values(sort_col, ascending=False, na_position="last")
 for col in ("Hazard Score", "Composite Score"):
     table_df[col] = table_df[col].round(4)
 
-st.dataframe(table_df.reset_index(drop=True), width="stretch", height=380)
+st.dataframe(table_df.reset_index(drop=True), use_container_width=True, height=380)
 
 csv = table_df.to_csv(index=False).encode("utf-8")
 st.download_button("⬇ Download CSV", csv, "nyc_flood_risk_nta.csv", "text/csv")
