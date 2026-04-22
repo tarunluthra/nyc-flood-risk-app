@@ -1,0 +1,6 @@
+*.tif
+*.zip
+__pycache__/
+.DS_Store
+*.aux.xml
+!data/nta_risk.geojson
